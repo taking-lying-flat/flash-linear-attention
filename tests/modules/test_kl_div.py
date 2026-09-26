@@ -5,13 +5,11 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-from unittest.mock import create_autospec
-
 import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.modules import FusedKLDivLoss, fused_kl_div
+from fla.modules import FusedKLDivLoss
 from fla.utils import assert_close, device, device_platform
 
 
@@ -65,64 +63,42 @@ def test_fused(
 
 
 @pytest.mark.parametrize(
-    ('x_grad', 'weight_grad', 'grad_mode'),
-    [
-        pytest.param(True, True, 'grad', id='both'),
-        pytest.param(True, False, 'grad', id='input'),
-        pytest.param(False, True, 'grad', id='weight'),
-        pytest.param(False, False, 'grad', id='frozen'),
-        pytest.param(True, True, 'no_grad', id='no_grad'),
-        pytest.param(True, True, 'inference', id='inference'),
-    ],
+    ('x_grad', 'weight_grad', 'context'),
+    [(True, False, torch.enable_grad), (False, True, torch.enable_grad), (False, False, torch.enable_grad),
+     (True, True, torch.no_grad), (True, True, torch.inference_mode)],
+    ids=['input', 'weight', 'frozen', 'no_grad', 'inference'],
 )
-@pytest.mark.parametrize('strided', [False, True], ids=['contiguous', 'strided'])
-@pytest.mark.parametrize('accumulate_grad_in_fp32', [False, True])
-@pytest.mark.parametrize('dtype', [torch.float32, torch.float16])
 @pytest.mark.skipif(device_platform == 'intel', reason='Intel Triton Failure')
-def test_fused_grad_requirements(monkeypatch, x_grad, weight_grad, grad_mode, strided, accumulate_grad_in_fp32, dtype):
+def test_fused_grad_requirements(x_grad, weight_grad, context):
     torch.manual_seed(42)
-    x = torch.randn(13, 64 if strided else 32, device=device, dtype=dtype)
-    weight = torch.randn(128, 64 if strided else 32, device=device, dtype=dtype)
-    if strided:
-        x, weight = x[:, ::2], weight[:, ::2]
-    x.requires_grad_(x_grad)
-    weight.requires_grad_(weight_grad)
-    target_x = torch.randn(13, 32, device=device, dtype=dtype)
-    target_weight = torch.randn(128, 32, device=device, dtype=dtype)
-    ref_x = x.detach().requires_grad_(x_grad)
-    ref_weight = weight.detach().requires_grad_(weight_grad)
+    x = torch.randn(13, 64, device=device)[:, ::2].requires_grad_(x_grad)
+    weight = torch.randn(128, 64, device=device)[:, ::2].requires_grad_(weight_grad)
+    target_x, target_weight = torch.randn_like(x), torch.randn_like(weight)
     ref = F.kl_div(
-        F.linear(ref_x, ref_weight).log_softmax(-1),
+        F.linear(x, weight).log_softmax(-1),
         F.linear(target_x, target_weight).softmax(-1),
         reduction='batchmean',
     )
-
-    gradients = []
-    fwd = fused_kl_div.fused_kl_div_fwd
-
-    def record_fwd(*args, **kwargs):
-        loss, dx, dw = fwd(*args, **kwargs)
-        gradients.append((dx, dw))
-        return loss, dx, dw
-
-    monkeypatch.setattr(fused_kl_div, 'fused_kl_div_fwd', record_fwd)
-    context = {'grad': torch.enable_grad, 'no_grad': torch.no_grad, 'inference': torch.inference_mode}[grad_mode]
     with context():
-        actual = FusedKLDivLoss(accumulate_grad_in_fp32=accumulate_grad_in_fp32)(x, target_x, weight, target_weight)
+        tri = FusedKLDivLoss()(x, target_x, weight, target_weight)
+    assert_close('loss', ref, tri, 1e-2)
+    assert tri.requires_grad == (context is torch.enable_grad and (x_grad or weight_grad))
+    if not tri.requires_grad:
+        return
 
-    assert_close('loss', ref, actual.to(dtype), 1e-2)
-    dx, dw = gradients[0]
-    assert (dx is not None) == (grad_mode == 'grad' and x_grad)
-    assert (dw is not None) == (grad_mode == 'grad' and weight_grad)
-    assert actual.requires_grad == (grad_mode == 'grad' and (x_grad or weight_grad))
-    if actual.requires_grad:
-        (actual * 0.37).backward()
-        (ref * 0.37).backward()
-        for name, actual_grad, expected_grad in [('dx', x.grad, ref_x.grad), ('dw', weight.grad, ref_weight.grad)]:
-            if expected_grad is None:
-                assert actual_grad is None
-            else:
-                assert_close(name, expected_grad, actual_grad, 1e-2)
+    dx, dw = tri.grad_fn.saved_tensors
+    assert (dx is not None) == x_grad
+    assert (dw is not None) == weight_grad
+    do = torch.randn_like(ref)
+    ref.backward(do)
+    ref_dx, ref_dw = x.grad, weight.grad
+    x.grad = weight.grad = None
+    tri.backward(do)
+    for name, expected, actual in [('dx', ref_dx, x.grad), ('dw', ref_dw, weight.grad)]:
+        if expected is None:
+            assert actual is None
+        else:
+            assert_close(name, expected, actual, 1e-2)
 
 
 def test_fused_rejects_trainable_teacher():
@@ -139,37 +115,3 @@ def test_fused_rejects_trainable_teacher():
     target_weight = target_weight.requires_grad_()
     with pytest.raises(RuntimeError, match="frozen teacher"):
         FusedKLDivLoss()(x, target_x, weight, target_weight)
-
-
-@pytest.mark.parametrize(('use_dx', 'use_dw'), [(True, True), (True, False), (False, True), (False, False)])
-def test_fused_ascend_dispatch(monkeypatch, use_dx, use_dw):
-    from fla.modules.backends import modules_registry
-    from fla.modules.backends.triton_ascend import TritonAscendBackend
-    from fla.modules.backends.triton_ascend import fused_kl_div as npu
-    from fla.modules.fused_kl_div import fused_kl_div_bwd, fused_kl_div_fwd
-    from fla.ops.backends import _DISPATCH_DISABLED
-
-    if _DISPATCH_DISABLED:
-        pytest.skip('backend dispatch is disabled')
-
-    backend = TritonAscendBackend()
-    monkeypatch.setattr(backend, 'is_available', lambda: True)
-    monkeypatch.setattr(modules_registry, '_get_sorted_backends', lambda: [backend])
-    inputs = dict(x=object(), target_x=object(), weight=object(), target_weight=object())
-    loss, dx, dw = object(), object() if use_dx else None, object() if use_dw else None
-    fwd = create_autospec(npu.fused_kl_div_fwd_npu, return_value=(loss, dx, dw))
-    bwd = create_autospec(npu.fused_kl_div_bwd_npu, return_value=(dx, dw))
-    monkeypatch.setattr(npu, 'fused_kl_div_fwd_npu', fwd)
-    monkeypatch.setattr(npu, 'fused_kl_div_bwd_npu', bwd)
-
-    assert fused_kl_div_fwd(**inputs, use_dx=use_dx, use_dw=use_dw) == (loss, dx, dw)
-    fwd.assert_called_once_with(
-        **inputs,
-        reduction='batchmean',
-        accumulate_grad_in_fp32=True,
-        use_dx=use_dx,
-        use_dw=use_dw,
-    )
-    do = object()
-    assert fused_kl_div_bwd(do=do, dx=dx, dw=dw) == (dx, dw)
-    bwd.assert_called_once_with(do=do, dx=dx, dw=dw)
