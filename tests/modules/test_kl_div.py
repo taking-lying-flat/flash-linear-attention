@@ -20,12 +20,6 @@ from fla.utils import assert_close, device, device_platform
 @pytest.mark.parametrize("reduction", ["batchmean"])
 @pytest.mark.parametrize("accumulate_grad_in_fp32", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-@pytest.mark.parametrize(
-    ('x_grad', 'weight_grad', 'context'),
-    [(True, True, torch.enable_grad), (True, False, torch.enable_grad), (False, True, torch.enable_grad),
-     (False, False, torch.enable_grad), (True, True, torch.no_grad), (True, True, torch.inference_mode)],
-    ids=['both', 'input', 'weight', 'frozen', 'no_grad', 'inference'],
-)
 @pytest.mark.skipif(
     device_platform == 'intel',
     reason="Intel Triton Failure",
@@ -38,50 +32,69 @@ def test_fused(
     reduction: str,
     accumulate_grad_in_fp32: bool,
     dtype: torch.dtype,
-    x_grad: bool,
-    weight_grad: bool,
-    context,
 ):
     torch.manual_seed(42)
-    x = torch.randn(B * T, D).to(device).to(dtype=dtype).requires_grad_(x_grad)
-    x_weight = torch.randn(V, D).to(device).to(dtype=dtype).requires_grad_(weight_grad)
+    x = torch.randn(B * T, D).to(device).to(dtype=dtype).requires_grad_()
+    x_weight = torch.randn(V, D).to(device).to(dtype=dtype).requires_grad_()
     target_x = torch.randn(B * T, D).to(device).to(dtype=dtype)
     target_weight = torch.randn(V, D).to(device).to(dtype=dtype)
 
-    if x_grad != weight_grad:
-        x = x.detach().t().contiguous().t().requires_grad_(x_grad)
-        x_weight = x_weight.detach().t().contiguous().t().requires_grad_(weight_grad)
-
-    with context():
-        ref = F.kl_div(
-            F.linear(x, x_weight).log_softmax(-1),
-            F.linear(target_x, target_weight).softmax(-1),
-            reduction=reduction,
-        ).to(dtype)
+    ref = F.kl_div(
+        F.linear(x, x_weight).log_softmax(-1),
+        F.linear(target_x, target_weight).softmax(-1),
+        reduction=reduction,
+    ).to(dtype)
     do = torch.randn_like(ref).to(device)
-    if ref.requires_grad:
-        ref.backward(do)
-    ref_dx, x.grad = x.grad, None
-    ref_dw, x_weight.grad = x_weight.grad, None
+    ref.backward(do)
+    ref_dx, x.grad = x.grad.clone(), None
+    ref_dw, x_weight.grad = x_weight.grad.clone(), None
 
-    with context():
-        tri = FusedKLDivLoss(
-            reduction=reduction,
-            accumulate_grad_in_fp32=accumulate_grad_in_fp32,
-        )(x, target_x, x_weight, target_weight)
-        if tri.requires_grad:
-            dx, dw = tri.grad_fn.saved_tensors
-            assert (dx is not None) == x_grad
-            assert (dw is not None) == weight_grad
-        tri = tri.to(dtype=dtype)
-    assert tri.requires_grad == ref.requires_grad
-    if tri.requires_grad:
-        tri.backward(do)
-    tri_dx, x.grad = x.grad, None
-    tri_dw, x_weight.grad = x_weight.grad, None
+    tri = FusedKLDivLoss(
+        reduction=reduction,
+        accumulate_grad_in_fp32=accumulate_grad_in_fp32,
+    )(x, target_x, x_weight, target_weight).to(dtype=dtype)
+    tri.backward(do)
+    tri_dx, x.grad = x.grad.clone(), None
+    tri_dw, x_weight.grad = x_weight.grad.clone(), None
 
     assert_close("  o", ref, tri, 1e-2)
-    for name, expected, actual in [('dx', ref_dx, tri_dx), ('dw', ref_dw, tri_dw)]:
+    assert_close(" dx", ref_dx, tri_dx, 1e-2)
+    assert_close(" dw", ref_dw, tri_dw, 1e-2)
+
+
+@pytest.mark.parametrize(
+    ('x_grad', 'weight_grad', 'context'),
+    [(True, False, torch.enable_grad), (False, True, torch.enable_grad), (False, False, torch.enable_grad),
+     (True, True, torch.no_grad), (True, True, torch.inference_mode)],
+    ids=['input', 'weight', 'frozen', 'no_grad', 'inference'],
+)
+@pytest.mark.skipif(device_platform == 'intel', reason='Intel Triton Failure')
+def test_fused_grad_requirements(x_grad, weight_grad, context):
+    torch.manual_seed(42)
+    x = torch.randn(13, 64, device=device)[:, ::2].requires_grad_(x_grad)
+    weight = torch.randn(128, 64, device=device)[:, ::2].requires_grad_(weight_grad)
+    target_x, target_weight = torch.randn_like(x), torch.randn_like(weight)
+    ref = F.kl_div(
+        F.linear(x, weight).log_softmax(-1),
+        F.linear(target_x, target_weight).softmax(-1),
+        reduction='batchmean',
+    )
+    with context():
+        tri = FusedKLDivLoss()(x, target_x, weight, target_weight)
+    assert_close('loss', ref, tri, 1e-2)
+    assert tri.requires_grad == (context is torch.enable_grad and (x_grad or weight_grad))
+    if not tri.requires_grad:
+        return
+
+    dx, dw = tri.grad_fn.saved_tensors
+    assert (dx is not None) == x_grad
+    assert (dw is not None) == weight_grad
+    do = torch.randn_like(ref)
+    ref.backward(do)
+    ref_dx, ref_dw = x.grad, weight.grad
+    x.grad = weight.grad = None
+    tri.backward(do)
+    for name, expected, actual in [('dx', ref_dx, x.grad), ('dw', ref_dw, weight.grad)]:
         if expected is None:
             assert actual is None
         else:
