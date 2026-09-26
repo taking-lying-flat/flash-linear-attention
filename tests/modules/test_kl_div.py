@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+from unittest.mock import create_autospec
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -76,3 +78,37 @@ def test_fused_rejects_trainable_teacher():
     target_weight = target_weight.requires_grad_()
     with pytest.raises(RuntimeError, match="frozen teacher"):
         FusedKLDivLoss()(x, target_x, weight, target_weight)
+
+
+@pytest.mark.parametrize(('use_dx', 'use_dw'), [(True, True), (True, False), (False, True), (False, False)])
+def test_fused_ascend_dispatch(monkeypatch, use_dx, use_dw):
+    from fla.modules.backends import modules_registry
+    from fla.modules.backends.triton_ascend import TritonAscendBackend
+    from fla.modules.backends.triton_ascend import fused_kl_div as npu
+    from fla.modules.fused_kl_div import fused_kl_div_bwd, fused_kl_div_fwd
+    from fla.ops.backends import _DISPATCH_DISABLED
+
+    if _DISPATCH_DISABLED:
+        pytest.skip('backend dispatch is disabled')
+
+    backend = TritonAscendBackend()
+    monkeypatch.setattr(backend, 'is_available', lambda: True)
+    monkeypatch.setattr(modules_registry, '_get_sorted_backends', lambda: [backend])
+    inputs = dict(x=object(), target_x=object(), weight=object(), target_weight=object())
+    loss, dx, dw = object(), object() if use_dx else None, object() if use_dw else None
+    fwd = create_autospec(npu.fused_kl_div_fwd_npu, return_value=(loss, dx, dw))
+    bwd = create_autospec(npu.fused_kl_div_bwd_npu, return_value=(dx, dw))
+    monkeypatch.setattr(npu, 'fused_kl_div_fwd_npu', fwd)
+    monkeypatch.setattr(npu, 'fused_kl_div_bwd_npu', bwd)
+
+    assert fused_kl_div_fwd(**inputs, use_dx=use_dx, use_dw=use_dw) == (loss, dx, dw)
+    fwd.assert_called_once_with(
+        **inputs,
+        reduction='batchmean',
+        accumulate_grad_in_fp32=True,
+        use_dx=use_dx,
+        use_dw=use_dw,
+    )
+    do = object()
+    assert fused_kl_div_bwd(do=do, dx=dx, dw=dw) == (dx, dw)
+    bwd.assert_called_once_with(do=do, dx=dx, dw=dw)

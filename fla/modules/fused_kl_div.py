@@ -123,15 +123,15 @@ def elementwise_mul_kernel(
 
 
 @dispatch('modules')
-def fused_kl_div_forward(
+def fused_kl_div_fwd(
     x: torch.Tensor,
     target_x: torch.Tensor,
     weight: torch.Tensor,
     target_weight: torch.Tensor,
     reduction: str = 'batchmean',
     accumulate_grad_in_fp32: bool = True,
-    need_dx: bool = True,
-    need_dw: bool = True,
+    use_dx: bool = True,
+    use_dw: bool = True,
 ):
     device = x.device
 
@@ -150,8 +150,8 @@ def fused_kl_div_forward(
 
     grad_dtype = torch.float32 if accumulate_grad_in_fp32 else weight.dtype
 
-    dx = torch.zeros_like(x, device=device) if need_dx else None
-    dw = torch.zeros_like(weight, device=device, dtype=grad_dtype) if need_dw else None
+    dx = torch.zeros_like(x, device=device) if use_dx else None
+    dw = torch.zeros_like(weight, device=device, dtype=grad_dtype) if use_dw else None
     # we use fp32 for loss accumulator
     loss = torch.zeros(N, dtype=torch.float32, device=device)
 
@@ -209,7 +209,7 @@ def fused_kl_div_forward(
 
 
 @dispatch('modules')
-def fused_kl_div_backward(
+def fused_kl_div_bwd(
     do: torch.Tensor,
     dx: torch.Tensor | None,
     dw: torch.Tensor | None,
@@ -246,15 +246,15 @@ class FusedKLDivLossFunction(torch.autograd.Function):
         accumulate_grad_in_fp32: bool,
         grad_enabled: bool,
     ):
-        loss, dx, dw = fused_kl_div_forward(
+        loss, dx, dw = fused_kl_div_fwd(
             x=x,
             target_x=target_x,
             weight=weight,
             target_weight=target_weight,
             reduction=reduction,
             accumulate_grad_in_fp32=accumulate_grad_in_fp32,
-            need_dx=grad_enabled and ctx.needs_input_grad[0],
-            need_dw=grad_enabled and ctx.needs_input_grad[2],
+            use_dx=grad_enabled and ctx.needs_input_grad[0],
+            use_dw=grad_enabled and ctx.needs_input_grad[2],
         )
         ctx.save_for_backward(dx, dw)
         return loss
@@ -263,7 +263,7 @@ class FusedKLDivLossFunction(torch.autograd.Function):
     @input_guard
     def backward(ctx, do):
         dx, dw = ctx.saved_tensors
-        dx, dw = fused_kl_div_backward(do=do, dx=dx, dw=dw)
+        dx, dw = fused_kl_div_bwd(do=do, dx=dx, dw=dw)
         return dx, None, dw, None, None, None, None
 
 

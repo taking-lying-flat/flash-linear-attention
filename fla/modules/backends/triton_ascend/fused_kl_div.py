@@ -99,15 +99,15 @@ def _npu_vocab_block_size(vocab_size: int, num_rows: int) -> int:
     return compute_vocab_block_size(vocab_size=vocab_size, num_rows=num_rows, memory_multiplier=_KLD_FWD_MEM_MULT)
 
 
-def fused_kl_div_forward_npu(
+def fused_kl_div_fwd_npu(
     x: torch.Tensor,
     target_x: torch.Tensor,
     weight: torch.Tensor,
     target_weight: torch.Tensor,
     reduction: str = 'batchmean',
     accumulate_grad_in_fp32: bool = True,
-    need_dx: bool = True,
-    need_dw: bool = True,
+    use_dx: bool = True,
+    use_dw: bool = True,
 ):
     device = x.device
 
@@ -119,8 +119,8 @@ def fused_kl_div_forward_npu(
 
     grad_dtype = torch.float32 if accumulate_grad_in_fp32 else weight.dtype
 
-    dx = torch.zeros_like(x, device=device) if need_dx else None
-    dw = torch.zeros_like(weight, device=device, dtype=grad_dtype) if need_dw else None
+    dx = torch.zeros_like(x, device=device) if use_dx else None
+    dw = torch.zeros_like(weight, device=device, dtype=grad_dtype) if use_dw else None
     loss = torch.zeros(N, dtype=torch.float32, device=device)
 
     for ic in range(NC):
@@ -162,7 +162,7 @@ def fused_kl_div_forward_npu(
     return loss, dx, dw
 
 
-def fused_kl_div_backward_npu(
+def fused_kl_div_bwd_npu(
     do: torch.Tensor,
     dx: torch.Tensor | None,
     dw: torch.Tensor | None,
