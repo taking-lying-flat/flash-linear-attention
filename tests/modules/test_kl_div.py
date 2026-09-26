@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from fla.modules import FusedKLDivLoss
+from fla.modules import FusedKLDivLoss, fused_kl_div
 from fla.utils import assert_close, device, device_platform
 
 
@@ -62,6 +62,67 @@ def test_fused(
     assert_close("  o", ref, tri, 1e-2)
     assert_close(" dx", ref_dx, tri_dx, 1e-2)
     assert_close(" dw", ref_dw, tri_dw, 1e-2)
+
+
+@pytest.mark.parametrize(
+    ('x_grad', 'weight_grad', 'grad_mode'),
+    [
+        pytest.param(True, True, 'grad', id='both'),
+        pytest.param(True, False, 'grad', id='input'),
+        pytest.param(False, True, 'grad', id='weight'),
+        pytest.param(False, False, 'grad', id='frozen'),
+        pytest.param(True, True, 'no_grad', id='no_grad'),
+        pytest.param(True, True, 'inference', id='inference'),
+    ],
+)
+@pytest.mark.parametrize('strided', [False, True], ids=['contiguous', 'strided'])
+@pytest.mark.parametrize('accumulate_grad_in_fp32', [False, True])
+@pytest.mark.parametrize('dtype', [torch.float32, torch.float16])
+@pytest.mark.skipif(device_platform == 'intel', reason='Intel Triton Failure')
+def test_fused_grad_requirements(monkeypatch, x_grad, weight_grad, grad_mode, strided, accumulate_grad_in_fp32, dtype):
+    torch.manual_seed(42)
+    x = torch.randn(13, 64 if strided else 32, device=device, dtype=dtype)
+    weight = torch.randn(128, 64 if strided else 32, device=device, dtype=dtype)
+    if strided:
+        x, weight = x[:, ::2], weight[:, ::2]
+    x.requires_grad_(x_grad)
+    weight.requires_grad_(weight_grad)
+    target_x = torch.randn(13, 32, device=device, dtype=dtype)
+    target_weight = torch.randn(128, 32, device=device, dtype=dtype)
+    ref_x = x.detach().requires_grad_(x_grad)
+    ref_weight = weight.detach().requires_grad_(weight_grad)
+    ref = F.kl_div(
+        F.linear(ref_x, ref_weight).log_softmax(-1),
+        F.linear(target_x, target_weight).softmax(-1),
+        reduction='batchmean',
+    )
+
+    gradients = []
+    fwd = fused_kl_div.fused_kl_div_fwd
+
+    def record_fwd(*args, **kwargs):
+        loss, dx, dw = fwd(*args, **kwargs)
+        gradients.append((dx, dw))
+        return loss, dx, dw
+
+    monkeypatch.setattr(fused_kl_div, 'fused_kl_div_fwd', record_fwd)
+    context = {'grad': torch.enable_grad, 'no_grad': torch.no_grad, 'inference': torch.inference_mode}[grad_mode]
+    with context():
+        actual = FusedKLDivLoss(accumulate_grad_in_fp32=accumulate_grad_in_fp32)(x, target_x, weight, target_weight)
+
+    assert_close('loss', ref, actual.to(dtype), 1e-2)
+    dx, dw = gradients[0]
+    assert (dx is not None) == (grad_mode == 'grad' and x_grad)
+    assert (dw is not None) == (grad_mode == 'grad' and weight_grad)
+    assert actual.requires_grad == (grad_mode == 'grad' and (x_grad or weight_grad))
+    if actual.requires_grad:
+        (actual * 0.37).backward()
+        (ref * 0.37).backward()
+        for name, actual_grad, expected_grad in [('dx', x.grad, ref_x.grad), ('dw', weight.grad, ref_weight.grad)]:
+            if expected_grad is None:
+                assert actual_grad is None
+            else:
+                assert_close(name, expected_grad, actual_grad, 1e-2)
 
 
 def test_fused_rejects_trainable_teacher():
